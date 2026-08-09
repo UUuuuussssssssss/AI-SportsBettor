@@ -295,15 +295,16 @@ class ResolutionRepository:
             return [dict(row) for row in connection.execute(statement).mappings()]
 
     def load_candidate_rows(self) -> list[dict[str, Any]]:
-        latest_nflverse_version = (
+        latest_completed_versions = (
             select(entity_bank_versions.c.version_id)
             .where(
-                entity_bank_versions.c.source == "nflverse",
                 entity_bank_versions.c.status == "completed",
             )
-            .order_by(entity_bank_versions.c.ingested_at.desc())
-            .limit(1)
-            .scalar_subquery()
+            .distinct(entity_bank_versions.c.source)
+            .order_by(
+                entity_bank_versions.c.source,
+                entity_bank_versions.c.ingested_at.desc(),
+            )
         )
         alias_statement = (
             select(
@@ -319,7 +320,7 @@ class ResolutionRepository:
                     entities.c.identity_status == IdentityStatus.PROVISIONAL.value,
                     and_(
                         entities.c.identity_status == IdentityStatus.CANONICAL.value,
-                        entities.c.latest_bank_version_id == latest_nflverse_version,
+                        entities.c.latest_bank_version_id.in_(latest_completed_versions),
                     ),
                 )
             )
@@ -336,7 +337,7 @@ class ResolutionRepository:
             )
             .join(team, team.c.entity_id == entity_relationships.c.object_entity_id)
             .where(
-                entity_relationships.c.predicate == "rostered_by",
+                entity_relationships.c.predicate.in_(("rostered_by", "coaches_for")),
                 or_(
                     entity_relationships.c.valid_to.is_(None),
                     entity_relationships.c.valid_to >= datetime.now(UTC),

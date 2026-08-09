@@ -13,18 +13,20 @@ The system gets three nflverse datasets:
 - Current NFL teams
 - Current-season rosters
 - Complete player history
+- Current coaching-staff directories from all 32 official NFL club sites
 
 The complete history is retained for identity bookkeeping. The active entity
-bank contains current teams and people on the current-season roster.
+bank contains current teams, people on the current-season roster, and people
+listed on the current official coaching staffs.
 
 **Outcome:** We have a current NFL source of truth without losing historical
 identity information.
 
 ### Step 2: Create one identity per real team or person
 
-Each team and player receives one stable internal identity. Provider IDs such
-as GSIS, ESPN, and PFR IDs are attached as supporting identifiers rather than
-used as the main identity.
+Each team, player, and coach receives one stable internal identity. Provider IDs
+such as GSIS, ESPN, and PFR IDs and official club directory evidence are attached
+as supporting identifiers rather than used as the main identity.
 
 **Outcome:** A person can change teams or gain a new provider ID without
 becoming a new person in the bank.
@@ -84,7 +86,7 @@ identifies:
 
 - Market topic
 - Contract type
-- Named players or teams
+- Named players, coaches, or teams
 - The role each name has in that market
 
 The event context helps interpret related markets consistently, while each
@@ -203,8 +205,8 @@ rerunning every unchanged record.
 
 The completed process produces:
 
-- A canonical bank of current NFL teams and rostered players
-- Supported aliases, roles, and roster relationships
+- A canonical bank of current NFL teams, rostered players, and coaching staffs
+- Supported aliases, roles, roster relationships, and coach/team relationships
 - Market-level and news-level entity mentions
 - Canonical links where identity is supported
 - Explicit ambiguous, unresolved, provisional, and ignored outcomes where it

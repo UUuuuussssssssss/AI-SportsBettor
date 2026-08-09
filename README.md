@@ -81,9 +81,12 @@ python -m src.entity_bank.audit --provider claude --event-limit 20
 
 # Preview the complete canonical nflverse registry as local JSONL
 python -m src.entity_bank.nflverse_sync --season 2026 --limit 100
+
+# Preview all current coaches from the 32 official NFL club directories
+python -m src.entity_bank.coach_sync --season 2026
 ```
 
-The bank uses internal IDs, keeps nflverse/provider IDs as mappings, records
+The bank uses internal IDs, keeps nflverse/official-club/provider IDs as mappings, records
 ambiguous and unresolved mentions instead of guessing, and never treats a
 prediction or social claim as factual roster membership. See
 [NFL entity bank and source resolution](docs/ENTITY_BANK.md) for schema,

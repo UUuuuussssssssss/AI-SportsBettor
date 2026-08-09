@@ -740,7 +740,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         bank_version_id = repository.latest_bank_version_id()
         if args.apply and not bank_version_id:
-            print("ERROR: run and apply nflverse_sync before entity resolution", file=sys.stderr)
+            print("ERROR: apply a canonical entity-bank source before resolution", file=sys.stderr)
             return 2
         index = CandidateIndex(repository.load_candidate_rows())
         batch = Batch()

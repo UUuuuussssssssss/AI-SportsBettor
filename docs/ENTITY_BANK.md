@@ -2,10 +2,12 @@
 
 ## Safety model
 
-The entity bank owns stable internal IDs. nflverse IDs are source mappings, not
-database primary keys. nflverse is the only automated source of factual roster
-relationships. A Polymarket destination market or X claim can create a mention,
-but cannot change who plays for which team.
+The entity bank owns stable internal IDs. Provider IDs are source mappings, not
+database primary keys. nflverse is the automated source of factual player roster
+relationships. The 32 official NFL club coaching-staff directories are the
+automated source of factual coach/team relationships. A Polymarket destination
+market or X claim can create a mention, but cannot change who plays or coaches
+for which team.
 
 Closed code-owned taxonomies constrain entity type, person role, mention role,
 market topic, contract type, identity status, resolution status, alias type,
@@ -23,16 +25,20 @@ entity IDs.
    JSONL files.
 3. An applied sync archives the exact files in one gzip GCS envelope and
    transactionally upserts the canonical registry.
-4. Gamma entity fields are normalized into `game_id`, `group_item_title`, and
+4. `coach_sync` fetches the 32 official NFL club coaching-staff directories,
+   requires one head coach and at least ten staff records per team, and creates
+   canonical people with `coach` roles and `coaches_for` relationships. Staff
+   titles and profile/directory URLs remain attached as source evidence.
+5. Gamma entity fields are normalized into `game_id`, `group_item_title`, and
    `group_item_threshold`. A one-time backfill can replay the latest raw Gamma
    envelope.
-5. News enrichment extracts and persists X mentions once from combined
+6. News enrichment extracts and persists X mentions once from combined
    tweet/article/media evidence. The resolution worker consumes those stored
    mentions without a second extraction call. Polymarket extraction remains in
    the entity worker.
-6. The worker retrieves a small lexical candidate set and asks Claude to choose
+7. The worker retrieves a small lexical candidate set and asks Claude to choose
    only from that allowlist when deterministic matching is insufficient.
-7. Results and attempts are versioned. Unresolved/ambiguous mentions are
+8. Results and attempts are versioned. Unresolved/ambiguous mentions are
    reconsidered after a new entity-bank version only when their candidate set
    changes.
 
@@ -51,8 +57,9 @@ market at a time.
 - X alone never creates an entity.
 - `Player A`, `Coach B`, `Other`, and similar options become terminal `ignored`
   mentions. The underlying market and token remain untouched.
-- A later nflverse sync merges a provisional identity only when its normalized
-  name maps to exactly one canonical alias. Collisions remain for review.
+- A later nflverse or official-coach sync merges a provisional identity only
+  when its normalized name maps to exactly one canonical alias. Collisions
+  remain for review.
 
 `entity_resolution_attempts` is append-only. The review queue is queried from
 current `ambiguous` and `unresolved` mentions; it is not a second mutable queue.
@@ -62,9 +69,9 @@ current `ambiguous` and `unresolved` mentions; it is not a second mutable queue.
 - `entity_bank_versions`: source snapshot and raw-object lineage
 - `entities`: canonical/provisional/merged identities
 - `entity_aliases`: source-attributed surface forms
-- `entity_source_mappings`: nflverse, GSIS, ESPN, PFR, and other provider IDs
+- `entity_source_mappings`: nflverse, official club, GSIS, ESPN, PFR, and other provider IDs
 - `entity_roles`: time/source-attributed roles
-- `entity_relationships`: nflverse roster evidence only
+- `entity_relationships`: nflverse roster and official club coaching evidence
 - `entity_mentions`: Polymarket/X evidence and current resolution
 - `news_entity_resolution_runs`: idempotent news handoff, including zero-mention results
 - `polymarket_market_classifications`: topic, contract type, and entity fingerprint
@@ -135,6 +142,9 @@ To audit only the canonical source:
 
 ```bash
 python -m src.entity_bank.nflverse_sync --season 2026 --limit 100
+
+# Preview all current coaching staffs from the 32 official club directories.
+python -m src.entity_bank.coach_sync --season 2026
 ```
 
 This performs network reads but no GCS or database reads/writes.
@@ -149,6 +159,14 @@ unmatched roster rows, and normalized alias collisions. It also writes
 player rows sharing an identifier, name, and non-conflicting birth date are
 merged. Contradictory roster rows are excluded from both entities and
 relationships rather than guessed.
+
+The coach dry run writes `current_coaches.jsonl`,
+`proposed_relationships.jsonl`, `quarantined_records.jsonl`, and `summary.json`
+under `data/local/entity_bank/coaches_*`. The official directory name is stored
+as a canonical alias. Alternate punctuation that normalizes identically is
+already handled by the shared name normalizer; unsupported nicknames are not
+invented and can be added later as source-attributed or manual aliases. A name
+listed by multiple teams is quarantined rather than merged by name alone.
 
 After migration, preview the Gamma replay without changing PostgreSQL:
 
@@ -183,6 +201,11 @@ python -m src.entity_bank.nflverse_sync \
   --apply \
   --confirm-live-writes APPLY_NFLVERSE_ENTITY_BANK
 
+python -m src.entity_bank.coach_sync \
+  --season 2026 \
+  --apply \
+  --confirm-live-writes APPLY_NFL_COACH_ENTITY_BANK
+
 python -m src.entity_bank.gamma_backfill \
   --apply \
   --confirm-live-writes APPLY_GAMMA_ENTITY_BACKFILL
@@ -203,10 +226,10 @@ python -m src.entity_bank.worker \
   --confirm-live-writes APPLY_ENTITY_RESOLUTIONS
 ```
 
-The mock provider is rejected with `--apply`. nflverse `--apply` rejects
-`--limit`, so a partial canonical bank cannot be written accidentally. Any
-remaining source identifier mapped to multiple internal entities aborts before
-GCS or PostgreSQL initialization.
+The mock provider is rejected with `--apply`. Both canonical-source syncs reject
+`--limit` with `--apply`, so a partial bank cannot be written accidentally. The
+coach sync also requires all canonical team identities to exist first. Any
+remaining source identifier collision aborts before coach rows are written.
 
 ## Continuous nflverse polling
 
@@ -279,3 +302,10 @@ separate internal identities and ambiguous aliases never auto-merge.
 
 Confirm nflverse and underlying provider licensing/retention terms before
 production use.
+
+Official club pages provide current directory names, titles, and sometimes
+profile URLs, but do not provide a universal immutable coach ID or a complete
+nickname/pronunciation registry. Coach identities therefore use a normalized
+official name within a collision-checked snapshot. A cross-team name collision
+blocks the applied sync and must be adjudicated instead of guessed. Exact source
+HTML is archived in GCS for auditability.
