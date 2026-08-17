@@ -3,10 +3,13 @@
 Every training example needs a (tweet, market) pair. This linker joins
 resolved news mentions to resolved market mentions on canonical entity IDs
 and records quality features (shared-entity count, mention roles, market
-topic) instead of filtering: weak links stay in the table so training-time
-filtering remains a choice, not a data loss. Markets that were provably
-final before the tweet published are the only exclusions, because no price
-reaction can exist for them.
+topic). A tweet is linked only to markets that were already observed and
+still tradable at publish time: a later listing cannot have a price
+reaction, and a market that was already final cannot either.
+
+Hourly runs are incremental. Each tweet is linked once, against the open
+book as it existed then. New markets do not walk back through old tweets.
+`--full` still rebuilds the whole graph for an explicit backfill.
 """
 
 from __future__ import annotations
@@ -16,11 +19,11 @@ import hashlib
 import sys
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import delete, exists, or_, select
 from sqlalchemy.dialects.postgresql import insert
 
 from src.db.engine import DatabaseResources, create_database_resources
@@ -29,16 +32,18 @@ from src.db.models import (
     ingest_cursors,
     kalshi_market_classifications,
     kalshi_markets,
+    news_entity_resolution_runs,
     news_events,
     news_market_links,
     polymarket_market_classifications,
     polymarket_markets,
 )
 
-LINKER_VERSION = "entity_overlap_v2"
+LINKER_VERSION = "entity_overlap_v3"
 LINKER_CURSOR_SOURCE = "linking"
 LINKER_CURSOR_STREAM = "news_market_links"
 RESOLVED_STATUS = "resolved"
+INCREMENTAL_LOOKBACK = timedelta(hours=24)
 
 
 def utc_now() -> datetime:
@@ -83,6 +88,13 @@ def market_final_before(mention: MarketMention, published_at: datetime) -> bool:
     )
 
 
+def market_open_at_publish(mention: MarketMention, published_at: datetime) -> bool:
+    """True when we had already observed the market before the tweet published."""
+    if mention.first_observed_at is None:
+        return False
+    return mention.first_observed_at <= published_at
+
+
 def _role_map(pairs: set[tuple[str, str, str | None]]) -> dict[str, dict[str, list[str]]]:
     roles: dict[str, set[str]] = defaultdict(set)
     hints: dict[str, set[str]] = defaultdict(set)
@@ -117,6 +129,8 @@ def build_links(
         for market_mention in markets_by_entity.get(news_mention.entity_id, ()):
             if market_final_before(market_mention, news_mention.published_at):
                 continue
+            if not market_open_at_publish(market_mention, news_mention.published_at):
+                continue
             pair = (news_mention.news_id, market_mention.market_id)
             pair_market.setdefault(pair, market_mention)
             pair_published.setdefault(pair, news_mention.published_at)
@@ -143,10 +157,6 @@ def build_links(
         shared_entity_ids = sorted(
             {entity_id for entity_id, _, _ in news_roles[pair]}
         )
-        market_open = (
-            market_mention.first_observed_at is None
-            or market_mention.first_observed_at <= published_at
-        )
         rows.append(
             {
                 "news_id": news_id,
@@ -160,7 +170,7 @@ def build_links(
                 "market_mention_roles": _role_map(market_roles[pair]),
                 "market_topic": market_mention.market_topic,
                 "contract_type": market_mention.contract_type,
-                "market_open_at_publish": market_open,
+                "market_open_at_publish": True,
                 "linker_version": LINKER_VERSION,
             }
         )
@@ -178,7 +188,26 @@ class LinkerRepository:
     def close(self) -> None:
         self.resources.close()
 
-    def load_news_mentions(self) -> list[NewsMention]:
+    def last_successful_run_at(self) -> datetime | None:
+        statement = select(ingest_cursors.c.last_successful_poll_at).where(
+            ingest_cursors.c.source == LINKER_CURSOR_SOURCE,
+            ingest_cursors.c.stream == LINKER_CURSOR_STREAM,
+        )
+        with self.resources.engine.connect() as connection:
+            value = connection.scalar(statement)
+        return value
+
+    def load_news_mentions(
+        self,
+        *,
+        since: datetime | None = None,
+        skip_linked: bool = True,
+    ) -> list[NewsMention]:
+        already_linked = exists(
+            select(news_market_links.c.news_id).where(
+                news_market_links.c.news_id == entity_mentions.c.news_id
+            )
+        )
         statement = (
             select(
                 entity_mentions.c.news_id,
@@ -195,6 +224,23 @@ class LinkerRepository:
             )
             .order_by(entity_mentions.c.news_id)
         )
+        if skip_linked:
+            statement = statement.where(~already_linked)
+        if since is not None:
+            lookback = since - INCREMENTAL_LOOKBACK
+            recently_resolved = exists(
+                select(news_entity_resolution_runs.c.news_id).where(
+                    news_entity_resolution_runs.c.news_id == entity_mentions.c.news_id,
+                    news_entity_resolution_runs.c.status == "completed",
+                    news_entity_resolution_runs.c.completed_at > since,
+                )
+            )
+            statement = statement.where(
+                or_(
+                    news_events.c.published_at > lookback,
+                    recently_resolved,
+                )
+            )
         with self.resources.engine.connect() as connection:
             return [
                 NewsMention(
@@ -314,19 +360,25 @@ class LinkerRepository:
                 for row in connection.execute(statement)
             ]
 
+    def delete_unopened_links(self) -> int:
+        """Drop pairs whose market was first observed after the tweet."""
+        statement = delete(news_market_links).where(
+            news_market_links.c.market_open_at_publish.is_(False)
+        )
+        with self.resources.engine.begin() as connection:
+            result = connection.execute(statement)
+        return int(result.rowcount or 0)
+
     def persist_links(
         self,
         rows: list[dict[str, Any]],
         *,
         run_started_at: datetime,
-        prune: bool = True,
+        prune: bool = False,
     ) -> int:
-        """Upsert the full recomputed link set; prune rows not regenerated.
-
-        The linker recomputes every link each run, so any row that did not
-        receive the current run's updated_at is stale (its mention resolution
-        changed or the market became final) and is removed on full runs.
-        """
+        """Upsert computed links. Full rebuilds also prune rows not regenerated."""
+        if not rows and not prune:
+            return 0
         with self.resources.engine.begin() as connection:
             for offset in range(0, len(rows), 500):
                 batch = [
@@ -401,13 +453,28 @@ class LinkerRepository:
             )
 
 
-def run_linker(repository: LinkerRepository, *, dry_run: bool = False) -> list[dict[str, Any]]:
+def run_linker(
+    repository: LinkerRepository,
+    *,
+    dry_run: bool = False,
+    full: bool = False,
+) -> list[dict[str, Any]]:
     run_started_at = utc_now()
-    news_mentions = repository.load_news_mentions()
+    since = None if full else repository.last_successful_run_at()
+    news_mentions = repository.load_news_mentions(
+        since=since,
+        skip_linked=not full,
+    )
     market_mentions = repository.load_market_mentions()
+    mode = "full" if full else "incremental"
+    window = (
+        "all tweets"
+        if since is None or full
+        else f"unlinked since {since.isoformat()}"
+    )
     print(
         f"Loaded {len(news_mentions)} resolved news mentions and "
-        f"{len(market_mentions)} resolved market mentions"
+        f"{len(market_mentions)} resolved market mentions ({mode}, {window})"
     )
     rows = build_links(news_mentions, market_mentions)
     linked_news = len({row["news_id"] for row in rows})
@@ -419,9 +486,18 @@ def run_linker(repository: LinkerRepository, *, dry_run: bool = False) -> list[d
     if dry_run:
         print("DRY RUN: skipped PostgreSQL writes")
         return rows
-    pruned = repository.persist_links(rows, run_started_at=run_started_at)
+    dropped = repository.delete_unopened_links()
+    if dropped:
+        print(f"Removed {dropped} links whose markets opened after the tweet")
+    pruned = repository.persist_links(
+        rows,
+        run_started_at=run_started_at,
+        prune=full,
+    )
     repository.finalize_run(run_started_at=run_started_at)
-    print(f"Committed {len(rows)} links (pruned {pruned} stale) at {LINKER_VERSION}")
+    print(
+        f"Committed {len(rows)} links (pruned {pruned} stale) at {LINKER_VERSION}"
+    )
     return rows
 
 
@@ -432,6 +508,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Compute and report links without writing to PostgreSQL",
     )
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help="Rebuild every tweet against the current book and prune stale rows",
+    )
     return parser
 
 
@@ -441,7 +522,7 @@ def main(argv: list[str] | None = None) -> int:
     repository: LinkerRepository | None = None
     try:
         repository = LinkerRepository.from_environment(src_dir)
-        run_linker(repository, dry_run=args.dry_run)
+        run_linker(repository, dry_run=args.dry_run, full=args.full)
         return 0
     except Exception as exc:
         print(f"ERROR: tweet-market linking failed: {exc}", file=sys.stderr)

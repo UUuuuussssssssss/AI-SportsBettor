@@ -17,6 +17,7 @@ from src.linking.linker import (
     NewsMention,
     build_links,
     market_final_before,
+    market_open_at_publish,
 )
 from src.linking.reactions import (
     LABEL_VERSION,
@@ -115,13 +116,13 @@ def test_market_final_before_publish_is_excluded() -> None:
     assert [row["market_id"] for row in rows] == ["m-3"]
 
 
-def test_market_discovered_after_publish_is_kept_but_flagged() -> None:
-    rows = build_links(
-        [news_mention()],
-        [market_mention(first_observed_at=NOW + timedelta(days=1))],
-    )
-    assert len(rows) == 1
-    assert rows[0]["market_open_at_publish"] is False
+def test_market_discovered_after_publish_is_excluded() -> None:
+    later = market_mention(first_observed_at=NOW + timedelta(days=1))
+    unknown = market_mention(market_id="m-2", first_observed_at=None)
+    assert market_open_at_publish(later, NOW) is False
+    assert market_open_at_publish(unknown, NOW) is False
+    rows = build_links([news_mention()], [later, unknown])
+    assert rows == []
 
 
 def test_links_are_deterministic_and_sorted() -> None:
@@ -193,7 +194,7 @@ def compiled_sql(connection: FakeConnection) -> str:
     )
 
 
-def test_linker_repository_upserts_prunes_and_checkpoints() -> None:
+def test_linker_repository_upserts_without_pruning_by_default() -> None:
     connection = FakeConnection()
     resources = SimpleNamespace(engine=FakeEngine(connection), close=lambda: None)
     repository = LinkerRepository(resources)  # type: ignore[arg-type]
@@ -205,10 +206,46 @@ def test_linker_repository_upserts_prunes_and_checkpoints() -> None:
     sql = compiled_sql(connection)
     assert "INSERT INTO news_market_links" in sql
     assert "ON CONFLICT (news_id, market_id) DO UPDATE" in sql
-    assert "DELETE FROM news_market_links" in sql
-    assert "news_market_links.updated_at <" in sql
+    assert "updated_at <" not in sql
     assert "INSERT INTO ingest_cursors" in sql
     assert "excluded.last_successful_poll_at >= ingest_cursors.last_successful_poll_at" in sql
+
+
+def test_full_rebuild_prunes_rows_not_regenerated() -> None:
+    connection = FakeConnection()
+    resources = SimpleNamespace(engine=FakeEngine(connection), close=lambda: None)
+    repository = LinkerRepository(resources)  # type: ignore[arg-type]
+    rows = build_links([news_mention()], [market_mention()])
+
+    repository.persist_links(rows, run_started_at=NOW, prune=True)
+
+    sql = compiled_sql(connection)
+    assert "DELETE FROM news_market_links" in sql
+    assert "news_market_links.updated_at <" in sql
+
+
+def test_incremental_news_query_skips_already_linked_tweets() -> None:
+    connection = FakeConnection()
+    resources = SimpleNamespace(engine=FakeEngine(connection), close=lambda: None)
+    repository = LinkerRepository(resources)  # type: ignore[arg-type]
+
+    assert repository.load_news_mentions(since=NOW, skip_linked=True) == []
+
+    sql = compiled_sql(connection)
+    assert "news_market_links" in sql
+    assert "news_entity_resolution_runs" in sql
+    assert "news_events.published_at >" in sql
+
+
+def test_delete_unopened_links_targets_flagged_rows() -> None:
+    connection = FakeConnection()
+    resources = SimpleNamespace(engine=FakeEngine(connection), close=lambda: None)
+    repository = LinkerRepository(resources)  # type: ignore[arg-type]
+
+    assert repository.delete_unopened_links() == 0
+    sql = compiled_sql(connection)
+    assert "DELETE FROM news_market_links" in sql
+    assert "market_open_at_publish" in sql
 
 
 def test_links_carry_their_platform() -> None:

@@ -32,10 +32,10 @@ news_events + news_enrichments + polymarket_markets ─────────�
 ## 1. Linker (`python -m src.linking.link_pull`)
 
 Joins resolved news mentions to resolved market mentions on canonical
-`entity_id`. The join is deterministic and mechanical — no LLM calls — and
-deliberately inclusive: any tweet sharing an entity with a market is linked,
-and quality features are recorded so weak links can be filtered at training
-time instead of being dropped at build time.
+`entity_id`. The join is deterministic and mechanical — no LLM calls. A
+tweet is linked only to markets that were already observed and still
+tradable at publish time. Markets listed after the tweet are not linked;
+new listings do not walk back through old tweets.
 
 Per `(news_id, market_id)` pair, `news_market_links` stores:
 
@@ -45,23 +45,22 @@ Per `(news_id, market_id)` pair, `news_market_links` stores:
   and person-role hints from each side.
 - `market_topic` / `contract_type` — from the market classification when one
   exists.
-- `market_open_at_publish` — false when the market was first observed only
-  after the tweet published (the market may not have existed yet). The link
-  is kept, flagged.
+- `market_open_at_publish` — always true for rows this version writes.
+  Existing false rows are deleted on the next live run.
 - `platform` — which exchange the market belongs to.
-- `linker_version` — currently `entity_overlap_v2` (platform-aware).
+- `linker_version` — currently `entity_overlap_v3`.
 
-The only exclusion: markets that were provably final before the tweet
-published, because no price reaction can exist for them. For Polymarket
-that means `closed_time` or `resolution_observed_at` earlier than
-`published_at`; for Kalshi, `close_time` (scheduled end of trading) or
-`settlement_ts` (actual settlement).
+Exclusions: markets first observed after the tweet, and markets that were
+provably final before the tweet published. For Polymarket that means
+`closed_time` or `resolution_observed_at` earlier than `published_at`; for
+Kalshi, `close_time` or `settlement_ts`. `first_observed_at` is our ingest
+clock, not the venue listing time.
 
-Each run recomputes the full link set and upserts it, then prunes rows that
-were not regenerated (their mention resolution changed or the market became
-final). Re-runs are idempotent and retroactive over every tweet already
-collected. The run checkpoint lives in `ingest_cursors` under
-`(linking, news_market_links)`.
+Hourly runs are incremental: only tweets that are not yet in
+`news_market_links` (with a 24-hour lookback plus newly completed
+resolutions) are joined to the current book. `--full` rebuilds every tweet
+and prunes rows that were not regenerated. The run checkpoint lives in
+`ingest_cursors` under `(linking, news_market_links)`.
 
 `--dry-run` computes and reports links without writing.
 
