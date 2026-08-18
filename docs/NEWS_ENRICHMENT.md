@@ -92,6 +92,10 @@ Configure `ANTHROPIC_API_KEY`, `NEWS_ENRICHMENT_MODEL`, and
 `claude-haiku-4-5-20251001`, which retains structured text and vision support
 at a lower token price than Sonnet. Output is capped at 1,536 tokens by default;
 override that only after evaluation with `NEWS_ENRICHMENT_MAX_OUTPUT_TOKENS`.
+The production job worker scores tweets in small batches (default pairs) using
+`NEWS_ENRICHMENT_BATCH_SIZE`. Set it to `1` to restore one Claude call per tweet,
+or raise it up to `10` after checking quality. Each tweet still persists its own
+`news_enrichments` row; token usage from a shared call is split across those rows.
 The current resolution-ready contract uses enrichment version `v3`; older rows
 remain available as historical audit records. Version `v3` tightens entity
 evidence binding and distinguishes NFL roster transactions from commercial

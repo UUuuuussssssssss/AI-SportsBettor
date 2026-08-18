@@ -13,6 +13,9 @@ DEFAULT_ENRICHMENT_VERSION = "v3"
 DEFAULT_MAX_OUTPUT_TOKENS = 1_536
 MIN_OUTPUT_TOKENS = 256
 MAX_OUTPUT_TOKENS = 4_096
+DEFAULT_BATCH_SIZE = 2
+MIN_BATCH_SIZE = 1
+MAX_BATCH_SIZE = 10
 
 
 @dataclass(frozen=True)
@@ -21,6 +24,7 @@ class EnrichmentSettings:
     model_name: str
     enrichment_version: str
     max_output_tokens: int
+    batch_size: int = DEFAULT_BATCH_SIZE
 
 
 def load_enrichment_settings(src_dir: Path) -> EnrichmentSettings:
@@ -39,6 +43,12 @@ def load_enrichment_settings(src_dir: Path) -> EnrichmentSettings:
             "NEWS_ENRICHMENT_MAX_OUTPUT_TOKENS must be between "
             f"{MIN_OUTPUT_TOKENS} and {MAX_OUTPUT_TOKENS}"
         )
+    batch_size = int(values.get("NEWS_ENRICHMENT_BATCH_SIZE", DEFAULT_BATCH_SIZE))
+    if not MIN_BATCH_SIZE <= batch_size <= MAX_BATCH_SIZE:
+        raise ValueError(
+            "NEWS_ENRICHMENT_BATCH_SIZE must be between "
+            f"{MIN_BATCH_SIZE} and {MAX_BATCH_SIZE}"
+        )
     return EnrichmentSettings(
         api_key=values.get("ANTHROPIC_API_KEY"),
         model_name=values.get("NEWS_ENRICHMENT_MODEL", DEFAULT_MODEL_NAME),
@@ -47,4 +57,5 @@ def load_enrichment_settings(src_dir: Path) -> EnrichmentSettings:
             DEFAULT_ENRICHMENT_VERSION,
         ),
         max_output_tokens=max_output_tokens,
+        batch_size=batch_size,
     )

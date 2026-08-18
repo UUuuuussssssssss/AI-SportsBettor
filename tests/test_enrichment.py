@@ -9,27 +9,35 @@ import pytest
 from PIL import Image
 
 from src.enrich_news.config import (
+    DEFAULT_BATCH_SIZE,
     DEFAULT_MAX_OUTPUT_TOKENS,
     DEFAULT_MODEL_NAME,
     load_enrichment_settings,
 )
 from src.enrich_news.dry_run import main as dry_run_main
 from src.enrich_news.models import (
+    BatchedEnrichmentOutput,
     EnrichmentOutput,
     EnrichmentResult,
     EntityType,
     ExtractedEntity,
     InformationStatus,
     NewsRecord,
+    PerTweetEnrichment,
     ProviderUsage,
     TagAssignment,
     TagCertainty,
     TopicTag,
     Usefulness,
 )
-from src.enrich_news.pipeline import enrich_record
+from src.enrich_news.pipeline import enrich_record, enrich_records
 from src.enrich_news.prompt import ENTITY_EXTRACTOR_VERSION, SYSTEM_PROMPT
-from src.enrich_news.provider import ClaudeProvider, DeterministicDryRunProvider, ProviderResponse
+from src.enrich_news.provider import (
+    ClaudeProvider,
+    DeterministicDryRunProvider,
+    ProviderResponse,
+    split_usage,
+)
 from src.enrich_news.repository import enrichment_values, tag_values
 from src.enrich_news.sources import (
     CollectedEvidence,
@@ -157,11 +165,13 @@ def test_enrichment_settings_load_ignored_src_env(
     monkeypatch.delenv("NEWS_ENRICHMENT_MODEL", raising=False)
     monkeypatch.delenv("NEWS_ENRICHMENT_VERSION", raising=False)
     monkeypatch.delenv("NEWS_ENRICHMENT_MAX_OUTPUT_TOKENS", raising=False)
+    monkeypatch.delenv("NEWS_ENRICHMENT_BATCH_SIZE", raising=False)
     (tmp_path / ".env").write_text(
         "ANTHROPIC_API_KEY=test-key\n"
         "NEWS_ENRICHMENT_MODEL=test-model\n"
         "NEWS_ENRICHMENT_VERSION=test-version\n"
-        "NEWS_ENRICHMENT_MAX_OUTPUT_TOKENS=900\n",
+        "NEWS_ENRICHMENT_MAX_OUTPUT_TOKENS=900\n"
+        "NEWS_ENRICHMENT_BATCH_SIZE=2\n",
         encoding="utf-8",
     )
 
@@ -171,8 +181,23 @@ def test_enrichment_settings_load_ignored_src_env(
     assert settings.model_name == "test-model"
     assert settings.enrichment_version == "test-version"
     assert settings.max_output_tokens == 900
+    assert settings.batch_size == 2
     assert DEFAULT_MODEL_NAME == "claude-haiku-4-5-20251001"
     assert DEFAULT_MAX_OUTPUT_TOKENS == 1_536
+    assert DEFAULT_BATCH_SIZE == 2
+
+
+def test_enrichment_settings_reject_invalid_batch_size(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("NEWS_ENRICHMENT_BATCH_SIZE", "0")
+    with pytest.raises(ValueError, match="NEWS_ENRICHMENT_BATCH_SIZE"):
+        load_enrichment_settings(tmp_path)
+    monkeypatch.setenv("NEWS_ENRICHMENT_BATCH_SIZE", "11")
+    with pytest.raises(ValueError, match="NEWS_ENRICHMENT_BATCH_SIZE"):
+        load_enrichment_settings(tmp_path)
 
 
 def test_offline_pipeline_classifies_and_fingerprints() -> None:
@@ -799,3 +824,169 @@ def test_dry_run_cli_writes_only_local_results(tmp_path: Path) -> None:
     )
     assert result.output
     assert result.output.tags[0].tag == TopicTag.INJURY_AVAILABILITY
+
+
+def _fixture_output(*, source_ref: str = "tweet", summary: str = "Injury update.") -> EnrichmentOutput:
+    return EnrichmentOutput(
+        tags=[
+            TagAssignment(
+                tag=TopicTag.INJURY_AVAILABILITY,
+                certainty=TagCertainty.CONFIDENT,
+                source_refs=[source_ref],
+            )
+        ],
+        information_status=InformationStatus.REPORTED,
+        usefulness=Usefulness.HIGH,
+        summary=summary,
+        classification_reason="The source reports an injury.",
+    )
+
+
+def test_split_usage_preserves_token_totals() -> None:
+    usage = ProviderUsage(input_tokens=11, output_tokens=5)
+    shares = split_usage(usage, 2)
+    assert shares[0].input_tokens + shares[1].input_tokens == 11
+    assert shares[0].output_tokens + shares[1].output_tokens == 5
+
+
+def test_enrich_records_uses_one_batch_call() -> None:
+    calls: list[list[str]] = []
+
+    class BatchProvider:
+        provider_name = "batch"
+        model_name = "test-model"
+
+        def enrich(self, _evidence: object) -> ProviderResponse:
+            raise AssertionError("single-tweet enrich should not be used for a pair")
+
+        def enrich_many(
+            self,
+            items: list[tuple[str, object]],
+        ) -> dict[str, ProviderResponse]:
+            calls.append([news_id for news_id, _evidence in items])
+            return {
+                news_id: ProviderResponse(
+                    output=_fixture_output(summary=f"Summary for {news_id}."),
+                    usage=ProviderUsage(input_tokens=3, output_tokens=1),
+                    model_name=self.model_name,
+                )
+                for news_id, _evidence in items
+            }
+
+    results = enrich_records(
+        [
+            NewsRecord(news_id="x:1", text="Player left practice with an ankle injury."),
+            NewsRecord(news_id="x:2", text="Starter is questionable for Sunday."),
+        ],
+        BatchProvider(),
+    )
+
+    assert calls == [["x:1", "x:2"]]
+    assert [result.news_id for result in results] == ["x:1", "x:2"]
+    assert all(result.status == "completed" for result in results)
+    assert results[0].usage.input_tokens == 3
+
+
+def test_enrich_records_fails_missing_news_id_only() -> None:
+    class PartialProvider:
+        provider_name = "batch"
+        model_name = "test-model"
+
+        def enrich(self, _evidence: object) -> ProviderResponse:
+            raise AssertionError("unused")
+
+        def enrich_many(
+            self,
+            items: list[tuple[str, object]],
+        ) -> dict[str, ProviderResponse]:
+            news_id, _evidence = items[0]
+            return {
+                news_id: ProviderResponse(
+                    output=_fixture_output(),
+                    usage=ProviderUsage(),
+                    model_name=self.model_name,
+                )
+            }
+
+    results = enrich_records(
+        [
+            NewsRecord(news_id="x:1", text="Player left practice with an ankle injury."),
+            NewsRecord(news_id="x:2", text="Starter is questionable for Sunday."),
+        ],
+        PartialProvider(),
+    )
+
+    assert results[0].status == "completed"
+    assert results[1].status == "failed"
+    assert results[1].error
+    assert "x:2" in results[1].error
+
+
+def test_claude_provider_enrich_many_namespaces_and_splits_usage() -> None:
+    parsed = BatchedEnrichmentOutput(
+        tweets=[
+            PerTweetEnrichment(
+                news_id="x:1",
+                tags=[
+                    TagAssignment(
+                        tag=TopicTag.INJURY_AVAILABILITY,
+                        certainty=TagCertainty.CONFIDENT,
+                        source_refs=["x:1/tweet"],
+                    )
+                ],
+                information_status=InformationStatus.REPORTED,
+                usefulness=Usefulness.HIGH,
+                summary="Tweet one injury.",
+                classification_reason="The first tweet reports an injury.",
+            ),
+            PerTweetEnrichment(
+                news_id="x:2",
+                tags=[
+                    TagAssignment(
+                        tag=TopicTag.INJURY_AVAILABILITY,
+                        certainty=TagCertainty.CONFIDENT,
+                        source_refs=["x:2/tweet"],
+                    )
+                ],
+                information_status=InformationStatus.REPORTED,
+                usefulness=Usefulness.HIGH,
+                summary="Tweet two injury.",
+                classification_reason="The second tweet reports an injury.",
+            ),
+        ]
+    )
+    calls: list[dict[str, object]] = []
+
+    class Messages:
+        def parse(self, **kwargs: object) -> object:
+            calls.append(kwargs)
+            return SimpleNamespace(
+                parsed_output=parsed,
+                stop_reason="end_turn",
+                usage=SimpleNamespace(
+                    input_tokens=11,
+                    output_tokens=5,
+                    cache_creation_input_tokens=0,
+                    cache_read_input_tokens=0,
+                ),
+            )
+
+    provider = ClaudeProvider.__new__(ClaudeProvider)
+    provider.model_name = "test-model"
+    provider.max_tokens = 1_536
+    provider.client = SimpleNamespace(messages=Messages())
+
+    responses = provider.enrich_many(
+        [
+            ("x:1", CollectedEvidence(text_sections=["[tweet]\nPlayer left practice."])),
+            ("x:2", CollectedEvidence(text_sections=["[tweet]\nStarter is questionable."])),
+        ]
+    )
+
+    assert set(responses) == {"x:1", "x:2"}
+    assert responses["x:1"].output.tags[0].source_refs == ["tweet"]
+    assert responses["x:2"].output.tags[0].source_refs == ["tweet"]
+    assert responses["x:1"].usage.input_tokens + responses["x:2"].usage.input_tokens == 11
+    assert calls[0]["output_format"] is BatchedEnrichmentOutput
+    assert int(calls[0]["max_tokens"]) >= 4_096
+    assert "independent tweets" in str(calls[0]["messages"])

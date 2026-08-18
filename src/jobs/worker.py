@@ -17,7 +17,8 @@ from typing import Any
 
 from src.db.engine import DatabaseResources, create_database_resources
 from src.enrich_news.config import EnrichmentSettings, load_enrichment_settings
-from src.enrich_news.pipeline import enrich_record
+from src.enrich_news.models import NewsRecord
+from src.enrich_news.pipeline import enrich_record, enrich_records
 from src.enrich_news.provider import ClaudeProvider
 from src.enrich_news.repository import EnrichmentRepository
 from src.entity_bank.provider import ClaudeEntityProvider
@@ -45,6 +46,42 @@ class JobResult:
     job_type: str
     outcome: str
     details: dict[str, Any]
+
+
+JobOutcome = JobResult | BaseException
+
+
+def pack_job_groups(
+    jobs: list[JobRecord],
+    *,
+    batch_size: int,
+) -> list[list[JobRecord]]:
+    """Group consecutive same-version enrich_news jobs up to ``batch_size``."""
+
+    if batch_size < 1:
+        raise ValueError("batch_size must be at least 1")
+    groups: list[list[JobRecord]] = []
+    pending: list[JobRecord] = []
+    pending_version: str | None = None
+    for job in jobs:
+        version = str(job.payload.get("enrichment_version") or "")
+        can_batch = job.job_type == ENRICH_NEWS and batch_size > 1
+        if not can_batch:
+            if pending:
+                groups.append(pending)
+                pending = []
+                pending_version = None
+            groups.append([job])
+            continue
+        if pending and (version != pending_version or len(pending) >= batch_size):
+            groups.append(pending)
+            pending = []
+        if not pending:
+            pending_version = version
+        pending.append(job)
+    if pending:
+        groups.append(pending)
+    return groups
 
 
 class WorkerRuntime:
@@ -117,6 +154,86 @@ class WorkerRuntime:
         if job.job_type == RESOLVE_KALSHI_MARKET:
             return self._handle_resolve_kalshi_market(job)
         raise ValueError(f"unsupported job type: {job.job_type}")
+
+    def handle_group(self, jobs: list[JobRecord]) -> list[tuple[JobRecord, JobOutcome]]:
+        if len(jobs) == 1:
+            try:
+                return [(jobs[0], self.handle(jobs[0]))]
+            except Exception as exc:
+                return [(jobs[0], exc)]
+        try:
+            return self._handle_enrich_news_batch(jobs)
+        except Exception as exc:
+            return [(job, exc) for job in jobs]
+
+    def _handle_enrich_news_batch(
+        self,
+        jobs: list[JobRecord],
+    ) -> list[tuple[JobRecord, JobOutcome]]:
+        outcomes: list[tuple[JobRecord, JobOutcome]] = []
+        pending: list[tuple[JobRecord, NewsRecord, str]] = []
+        for job in jobs:
+            news_id = str(job.payload["news_id"])
+            version = str(
+                job.payload.get("enrichment_version") or self.settings.enrichment_version
+            )
+            if self.enrichment_repository.has_completed(
+                news_id=news_id,
+                enrichment_version=version,
+            ):
+                outcomes.append(
+                    (job, JobResult(job.job_id, job.job_type, "already_completed", {}))
+                )
+                continue
+            record = self.enrichment_repository.load_record(news_id)
+            if record is None:
+                outcomes.append((job, ValueError(f"news row does not exist: {news_id}")))
+                continue
+            pending.append((job, record, version))
+        if not pending:
+            return outcomes
+
+        provider, _ = self._providers()
+        has_video = any(
+            (media.media_type or "").casefold() in {"video", "animated_gif"}
+            for _job, record, _version in pending
+            for media in record.media
+        )
+        semaphore = self.video_slots if has_video else _NullSemaphore()
+        version = pending[0][2]
+        with semaphore:
+            results = enrich_records(
+                [record for _job, record, _version in pending],
+                provider,
+                enrichment_version=version,
+                allow_network=self.allow_network,
+            )
+        for (job, _record, job_version), result in zip(pending, results, strict=True):
+            if result.enrichment_version != job_version:
+                result = result.model_copy(update={"enrichment_version": job_version})
+            if not result.status.startswith("completed"):
+                outcomes.append(
+                    (job, RuntimeError(result.error or "news enrichment failed"))
+                )
+                continue
+            self.enrichment_repository.persist_result(result)
+            outcomes.append(
+                (
+                    job,
+                    JobResult(
+                        job.job_id,
+                        job.job_type,
+                        "completed",
+                        {
+                            "news_id": result.news_id,
+                            "input_tokens": result.usage.input_tokens,
+                            "output_tokens": result.usage.output_tokens,
+                            "batch_size": len(pending),
+                        },
+                    ),
+                )
+            )
+        return outcomes
 
     def _handle_enrich_news(self, job: JobRecord) -> JobResult:
         news_id = str(job.payload["news_id"])
@@ -397,13 +514,17 @@ def main(argv: list[str] | None = None) -> int:
 
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)
-    futures: dict[Future[JobResult], JobRecord] = {}
+    futures: dict[
+        Future[list[tuple[JobRecord, JobOutcome]]],
+        list[JobRecord],
+    ] = {}
     exit_code = 0
     _log(
         "JOB_WORKER_STARTED",
         concurrency=args.concurrency,
         video_concurrency=args.video_concurrency,
         market_concurrency=args.market_concurrency,
+        enrichment_batch_size=settings.batch_size,
         job_types=sorted(job_types),
         lease_owner=lease_owner,
     )
@@ -415,33 +536,36 @@ def main(argv: list[str] | None = None) -> int:
             while not stopping.is_set() or futures:
                 done = {future for future in futures if future.done()}
                 for future in done:
-                    job = futures.pop(future)
+                    group = futures.pop(future)
                     try:
-                        result = future.result()
+                        outcomes = future.result()
                     except Exception as exc:
-                        status = jobs.fail(
-                            job,
-                            lease_owner=lease_owner,
-                            error=f"{type(exc).__name__}: {exc}",
-                        )
-                        _log(
-                            "JOB_FAILED",
-                            job_id=job.job_id,
-                            job_type=job.job_type,
-                            attempts=job.attempts,
-                            status=status,
-                            error=f"{type(exc).__name__}: {exc}",
-                        )
-                        if status == "dead":
-                            exit_code = 1
-                    else:
+                        outcomes = [(job, exc) for job in group]
+                    for job, outcome in outcomes:
+                        if isinstance(outcome, BaseException):
+                            status = jobs.fail(
+                                job,
+                                lease_owner=lease_owner,
+                                error=f"{type(outcome).__name__}: {outcome}",
+                            )
+                            _log(
+                                "JOB_FAILED",
+                                job_id=job.job_id,
+                                job_type=job.job_type,
+                                attempts=job.attempts,
+                                status=status,
+                                error=f"{type(outcome).__name__}: {outcome}",
+                            )
+                            if status == "dead":
+                                exit_code = 1
+                            continue
                         jobs.complete(job, lease_owner=lease_owner)
                         _log(
                             "JOB_COMPLETED",
-                            job_id=result.job_id,
-                            job_type=result.job_type,
-                            outcome=result.outcome,
-                            **result.details,
+                            job_id=outcome.job_id,
+                            job_type=outcome.job_type,
+                            outcome=outcome.outcome,
+                            **outcome.details,
                         )
 
                 if stopping.is_set():
@@ -455,14 +579,20 @@ def main(argv: list[str] | None = None) -> int:
 
                 capacity = args.concurrency - len(futures)
                 if capacity:
+                    claim_limit = capacity
+                    if ENRICH_NEWS in job_types:
+                        claim_limit = capacity * settings.batch_size
                     claimed = jobs.claim(
-                        limit=capacity,
+                        limit=claim_limit,
                         lease_owner=lease_owner,
                         lease_seconds=args.lease_seconds,
                         job_types=job_types,
                     )
-                    for job in claimed:
-                        futures[executor.submit(runtime.handle, job)] = job
+                    for group in pack_job_groups(
+                        claimed,
+                        batch_size=settings.batch_size,
+                    ):
+                        futures[executor.submit(runtime.handle_group, group)] = group
 
                 if args.once and not futures and jobs.unfinished_count(
                     job_types=job_types

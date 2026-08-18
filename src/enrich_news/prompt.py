@@ -87,3 +87,24 @@ def build_user_prompt(evidence_text: str, source_refs: list[str]) -> str:
         "reference identifiers.\n\n"
         f"{evidence_text}"
     )
+
+
+def build_batch_user_prompt(items: list[tuple[str, str, list[str]]]) -> str:
+    """Build one user prompt for independently scored tweets.
+
+    Each item is ``(news_id, evidence_text, source_refs)``.
+    """
+
+    all_refs = [ref for _news_id, _text, refs in items for ref in refs]
+    blocks = [
+        f"===== news_id {news_id} =====\n{evidence_text}"
+        for news_id, evidence_text, _refs in items
+    ]
+    header = build_user_prompt("\n\n".join(blocks), all_refs)
+    return (
+        header
+        + "\n\nThese are independent tweets. Classify each tweet using only its own "
+        "evidence. Do not copy entities, tags, or claims from one tweet onto another. "
+        "Return exactly one result per listed news_id, using that news_id verbatim. "
+        "For each entity, copy source_refs only from that tweet's allowed references."
+    )

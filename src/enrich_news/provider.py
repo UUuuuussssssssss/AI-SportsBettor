@@ -12,6 +12,7 @@ from pydantic import ValidationError
 
 from src.enrich_news.config import DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_MODEL_NAME
 from src.enrich_news.models import (
+    BatchedEnrichmentOutput,
     EnrichmentOutput,
     ExtractedClaim,
     InformationStatus,
@@ -21,8 +22,16 @@ from src.enrich_news.models import (
     TopicTag,
     Usefulness,
 )
-from src.enrich_news.prompt import SYSTEM_PROMPT, build_user_prompt
-from src.enrich_news.sources import CollectedEvidence
+from src.enrich_news.prompt import SYSTEM_PROMPT, build_batch_user_prompt, build_user_prompt
+from src.enrich_news.sources import CollectedEvidence, ImagePayload
+
+BATCH_TIMEOUT_SECONDS = 180.0
+BATCH_OUTPUT_TOKENS_PER_ITEM = 2_048
+MAX_BATCH_OUTPUT_TOKENS = 16_384
+BATCH_SYSTEM_ADDENDUM = (
+    "\nYou are scoring several independent tweets in one response. "
+    "Keep each tweet's extraction isolated."
+)
 
 
 @dataclass(frozen=True)
@@ -37,6 +46,60 @@ class EnrichmentProvider(Protocol):
     model_name: str
 
     def enrich(self, evidence: CollectedEvidence) -> ProviderResponse: ...
+
+
+def split_usage(usage: ProviderUsage, count: int) -> list[ProviderUsage]:
+    """Divide one API call's tokens across the tweets scored in that call."""
+
+    if count < 1:
+        raise ValueError("count must be at least 1")
+    shares: list[ProviderUsage] = []
+    for index in range(count):
+        shares.append(
+            ProviderUsage(
+                input_tokens=_share_tokens(usage.input_tokens, count, index),
+                output_tokens=_share_tokens(usage.output_tokens, count, index),
+                cache_creation_input_tokens=_share_tokens(
+                    usage.cache_creation_input_tokens, count, index
+                ),
+                cache_read_input_tokens=_share_tokens(
+                    usage.cache_read_input_tokens, count, index
+                ),
+            )
+        )
+    return shares
+
+
+def _share_tokens(total: int, count: int, index: int) -> int:
+    base, remainder = divmod(total, count)
+    return base + (remainder if index == 0 else 0)
+
+
+def _namespaced_prompt_parts(
+    news_id: str,
+    evidence: CollectedEvidence,
+) -> tuple[str, list[str], list[ImagePayload]]:
+    mapping = {ref: f"{news_id}/{ref}" for ref in evidence.source_refs()}
+    text = evidence.as_prompt_text()
+    for old, new in sorted(mapping.items(), key=lambda item: -len(item[0])):
+        text = text.replace(f"[{old}]", f"[{new}]")
+    images = [
+        ImagePayload(
+            source_ref=mapping.get(image.source_ref, f"{news_id}/{image.source_ref}"),
+            media_type=image.media_type,
+            data=image.data,
+            sha256=image.sha256,
+        )
+        for image in evidence.images
+    ]
+    return text, [mapping[ref] for ref in evidence.source_refs()], images
+
+
+def _denamespace_output(news_id: str, output: EnrichmentOutput) -> EnrichmentOutput:
+    prefix = f"{news_id}/"
+    for item in [*output.tags, *output.entities, *output.claims]:
+        item.source_refs = [ref.removeprefix(prefix) for ref in item.source_refs]
+    return output
 
 
 class ClaudeProvider:
@@ -75,6 +138,96 @@ class ClaudeProvider:
             f"Validation feedback: {validation_feedback[:4_000]}"
         )
         return self._enrich(evidence, system_addendum=correction)
+
+    def enrich_many(
+        self,
+        items: list[tuple[str, CollectedEvidence]],
+    ) -> dict[str, ProviderResponse]:
+        if not items:
+            return {}
+        if len(items) == 1:
+            news_id, evidence = items[0]
+            return {news_id: self.enrich(evidence)}
+
+        prompt_items: list[tuple[str, str, list[str]]] = []
+        images: list[ImagePayload] = []
+        for news_id, evidence in items:
+            text, source_refs, tweet_images = _namespaced_prompt_parts(news_id, evidence)
+            prompt_items.append((news_id, text, source_refs))
+            images.extend(tweet_images[:20])
+
+        content: list[dict[str, object]] = []
+        for image in images:
+            content.append(
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": image.media_type,
+                        "data": base64.b64encode(image.data).decode("ascii"),
+                    },
+                }
+            )
+            content.append(
+                {
+                    "type": "text",
+                    "text": f"The preceding image has source reference [{image.source_ref}].",
+                }
+            )
+        content.append({"type": "text", "text": build_batch_user_prompt(prompt_items)})
+        max_tokens = min(
+            MAX_BATCH_OUTPUT_TOKENS,
+            max(self.max_tokens, BATCH_OUTPUT_TOKENS_PER_ITEM * len(items)),
+        )
+        request = {
+            "model": self.model_name,
+            "max_tokens": max_tokens,
+            "messages": [{"role": "user", "content": content}],
+            "output_format": BatchedEnrichmentOutput,
+        }
+        system_prompt = SYSTEM_PROMPT + BATCH_SYSTEM_ADDENDUM
+        client = self.client
+        with_options = getattr(client, "with_options", None)
+        if callable(with_options):
+            client = with_options(timeout=BATCH_TIMEOUT_SECONDS)
+        try:
+            response = client.messages.parse(system=system_prompt, **request)
+        except ValidationError as exc:
+            correction = (
+                "\n\nYour previous response failed output-schema validation. Regenerate the "
+                "complete batched answer from the supplied evidence and satisfy every schema "
+                f"limit. Validation error: {str(exc)[:4_000]}"
+            )
+            response = client.messages.parse(
+                system=system_prompt + correction,
+                **request,
+            )
+        if response.parsed_output is None:
+            raise RuntimeError(f"Claude returned no structured output ({response.stop_reason})")
+        parsed: BatchedEnrichmentOutput = response.parsed_output
+        expected = {news_id for news_id, _evidence in items}
+        usage = ProviderUsage(
+            input_tokens=response.usage.input_tokens,
+            output_tokens=response.usage.output_tokens,
+            cache_creation_input_tokens=(response.usage.cache_creation_input_tokens or 0),
+            cache_read_input_tokens=response.usage.cache_read_input_tokens or 0,
+        )
+        ordered: list[tuple[str, EnrichmentOutput]] = []
+        seen: set[str] = set()
+        for item in parsed.tweets:
+            if item.news_id not in expected or item.news_id in seen:
+                continue
+            seen.add(item.news_id)
+            ordered.append((item.news_id, _denamespace_output(item.news_id, item.to_output())))
+        shares = split_usage(usage, len(ordered) or 1)
+        return {
+            news_id: ProviderResponse(
+                output=output,
+                usage=shares[index],
+                model_name=self.model_name,
+            )
+            for index, (news_id, output) in enumerate(ordered)
+        }
 
     def _enrich(
         self,
@@ -292,3 +445,9 @@ class DeterministicDryRunProvider:
             usage=ProviderUsage(),
             model_name=self.model_name,
         )
+
+    def enrich_many(
+        self,
+        items: list[tuple[str, CollectedEvidence]],
+    ) -> dict[str, ProviderResponse]:
+        return {news_id: self.enrich(evidence) for news_id, evidence in items}

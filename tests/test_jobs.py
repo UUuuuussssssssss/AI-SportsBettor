@@ -9,11 +9,18 @@ from src.enrich_news.config import EnrichmentSettings
 from src.jobs.repository import (
     ENRICH_NEWS,
     RESOLVE_KALSHI_MARKET,
+    RESOLVE_NEWS,
     SUPPORTED_JOB_TYPES,
+    JobRecord,
     JobRepository,
     enqueue_job,
 )
-from src.jobs.worker import DEFAULT_CONCURRENCY, MAX_CONCURRENCY, WorkerRuntime
+from src.jobs.worker import (
+    DEFAULT_CONCURRENCY,
+    MAX_CONCURRENCY,
+    WorkerRuntime,
+    pack_job_groups,
+)
 
 
 class FakeConnection:
@@ -153,6 +160,7 @@ def test_worker_uses_one_provider_pair_per_thread(monkeypatch: Any) -> None:
         model_name="test-model",
         enrichment_version="v3",
         max_output_tokens=512,
+        batch_size=2,
     )
     runtime = WorkerRuntime(
         resources=DatabaseResources(engine=FakeEngine()),  # type: ignore[arg-type]
@@ -177,3 +185,50 @@ def test_worker_uses_one_provider_pair_per_thread(monkeypatch: Any) -> None:
     assert len(created) == 8
     assert DEFAULT_CONCURRENCY == 10
     assert MAX_CONCURRENCY == 30
+
+
+def _job(
+    job_id: str,
+    *,
+    job_type: str = ENRICH_NEWS,
+    version: str = "v3",
+) -> JobRecord:
+    payload = {"news_id": job_id}
+    if version:
+        payload["enrichment_version"] = version
+    return JobRecord(
+        job_id=job_id,
+        job_type=job_type,
+        idempotency_key=job_id,
+        payload=payload,
+        attempts=1,
+        max_attempts=5,
+    )
+
+
+def test_pack_job_groups_batches_same_version_enrich_news() -> None:
+    groups = pack_job_groups(
+        [
+            _job("1"),
+            _job("2"),
+            _job("3"),
+            _job("resolve", job_type=RESOLVE_NEWS),
+            _job("4"),
+            _job("5", version="v4"),
+            _job("6", version="v4"),
+        ],
+        batch_size=2,
+    )
+
+    assert [[job.job_id for job in group] for group in groups] == [
+        ["1", "2"],
+        ["3"],
+        ["resolve"],
+        ["4"],
+        ["5", "6"],
+    ]
+
+
+def test_pack_job_groups_keeps_singles_when_batch_size_is_one() -> None:
+    groups = pack_job_groups([_job("1"), _job("2")], batch_size=1)
+    assert [[job.job_id for job in group] for group in groups] == [["1"], ["2"]]

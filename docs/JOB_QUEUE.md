@@ -16,10 +16,11 @@ notifications cannot lose work and processing latency remains bounded.
 ## Concurrency
 
 The default is 10 worker threads. Each thread owns its Anthropic clients.
-Additional semaphores cap video jobs at 2 and Polymarket event jobs at 5, which
-keeps CPU, memory, network, and Cloud SQL pressure bounded on an `e2-small`.
-The hard CLI maximum is 30, but increasing it is not recommended without
-observing rate limits and VM memory.
+`enrich_news` jobs are grouped by `NEWS_ENRICHMENT_BATCH_SIZE` (default 2) so
+one Haiku call can score a pair. Additional semaphores cap video jobs at 2 and
+Polymarket event jobs at 5, which keeps CPU, memory, network, and Cloud SQL
+pressure bounded on an `e2-small`. The hard CLI maximum is 30, but increasing
+it is not recommended without observing rate limits and VM memory.
 
 ## First deployment
 

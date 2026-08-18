@@ -174,6 +174,38 @@ class EnrichmentOutput(BaseModel):
         return self
 
 
+class PerTweetEnrichment(BaseModel):
+    """One tweet's extraction inside a batched Claude response."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    news_id: str = Field(min_length=1)
+    tags: list[TagAssignment] = Field(min_length=1)
+    information_status: InformationStatus
+    usefulness: Usefulness
+    summary: str = Field(min_length=1, max_length=2_000)
+    classification_reason: str = Field(min_length=1, max_length=4_000)
+    entities: list[ExtractedEntity] = Field(default_factory=list, max_length=12)
+    claims: list[ExtractedClaim] = Field(default_factory=list, max_length=8)
+
+    def to_output(self) -> EnrichmentOutput:
+        return EnrichmentOutput(
+            tags=self.tags,
+            information_status=self.information_status,
+            usefulness=self.usefulness,
+            summary=self.summary,
+            classification_reason=self.classification_reason,
+            entities=self.entities,
+            claims=self.claims,
+        )
+
+
+class BatchedEnrichmentOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    tweets: list[PerTweetEnrichment]
+
+
 class ProviderUsage(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import html
 import json
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from src.enrich_news.models import (
@@ -15,7 +16,7 @@ from src.enrich_news.models import (
     ProviderUsage,
 )
 from src.enrich_news.prompt import ENTITY_EXTRACTOR_VERSION, PROMPT_VERSION
-from src.enrich_news.provider import EnrichmentProvider
+from src.enrich_news.provider import EnrichmentProvider, ProviderResponse
 from src.enrich_news.sources import CollectedEvidence, collect_evidence
 from src.entity_bank.normalization import normalize_name
 
@@ -141,13 +142,16 @@ def _usage_sum(first: ProviderUsage, second: ProviderUsage) -> ProviderUsage:
     )
 
 
-def enrich_record(
-    record: NewsRecord,
-    provider: EnrichmentProvider,
-    *,
-    enrichment_version: str = "v1",
-    allow_network: bool = False,
-) -> EnrichmentResult:
+@dataclass
+class _PreparedEnrichment:
+    record: NewsRecord
+    evidence: CollectedEvidence
+    input_manifest: dict
+    input_fingerprint: str
+    started_at: datetime
+
+
+def _prepare_record(record: NewsRecord, *, allow_network: bool) -> _PreparedEnrichment:
     started_at = datetime.now(UTC)
     evidence = collect_evidence(record, allow_network=allow_network)
     if len(evidence.images) > 20:
@@ -176,97 +180,242 @@ def enrich_record(
             }
         )
     ).hexdigest()
+    return _PreparedEnrichment(
+        record=record,
+        evidence=evidence,
+        input_manifest=input_manifest,
+        input_fingerprint=input_fingerprint,
+        started_at=started_at,
+    )
+
+
+def _failed_result(
+    prepared: _PreparedEnrichment,
+    provider: EnrichmentProvider,
+    *,
+    enrichment_version: str,
+    response: ProviderResponse | None,
+    usage: ProviderUsage,
+    exc: Exception,
+) -> EnrichmentResult:
+    return EnrichmentResult(
+        news_id=prepared.record.news_id,
+        enrichment_version=enrichment_version,
+        entity_extractor_version=ENTITY_EXTRACTOR_VERSION,
+        provider=provider.provider_name,
+        model_name=response.model_name if response else provider.model_name,
+        status="failed",
+        input_fingerprint=prepared.input_fingerprint,
+        input_manifest=prepared.input_manifest,
+        usage=usage,
+        warnings=prepared.evidence.warnings,
+        error=f"{type(exc).__name__}: {str(exc)[:4_000]}",
+        started_at=prepared.started_at,
+        completed_at=datetime.now(UTC),
+    )
+
+
+def _finalize_result(
+    prepared: _PreparedEnrichment,
+    provider: EnrichmentProvider,
+    response: ProviderResponse,
+    *,
+    enrichment_version: str,
+    usage: ProviderUsage,
+) -> EnrichmentResult:
+    evidence = prepared.evidence
+    record = prepared.record
+    source_aliases = {record.source_url: "tweet"} if record.source_url else {}
+    _validate_source_refs(response.output, evidence, source_aliases)
+    invalid = _repair_entity_evidence(response.output, evidence)
+    repair = getattr(provider, "repair", None)
+    if invalid and callable(repair):
+        feedback = "; ".join(f"{entity.name!r}: {reason}" for entity, reason in invalid)
+        try:
+            retry = repair(evidence, feedback)
+            usage = _usage_sum(usage, retry.usage)
+            _validate_source_refs(retry.output, evidence, source_aliases)
+            retry_invalid = _repair_entity_evidence(retry.output, evidence)
+            retry_invalid_ids = {id(entity) for entity, _reason in retry_invalid}
+            retry_entities = {
+                (
+                    normalize_name(html.unescape(entity.name)),
+                    entity.entity_type,
+                    entity.mention_role,
+                ): entity
+                for entity in retry.output.entities
+                if id(entity) not in retry_invalid_ids
+            }
+            invalid_ids = {id(entity) for entity, _reason in invalid}
+            unresolved: list[tuple[ExtractedEntity, str]] = []
+            repaired_entities = []
+            for entity in response.output.entities:
+                if id(entity) not in invalid_ids:
+                    repaired_entities.append(entity)
+                    continue
+                key = (
+                    normalize_name(html.unescape(entity.name)),
+                    entity.entity_type,
+                    entity.mention_role,
+                )
+                replacement = retry_entities.get(key)
+                if replacement is None:
+                    unresolved.append(
+                        (entity, "validation-repair retry did not return valid evidence")
+                    )
+                else:
+                    repaired_entities.append(replacement)
+                    evidence.warnings.append(
+                        f"entity evidence repaired by provider retry: {entity.name}"
+                    )
+            response.output.entities = repaired_entities
+            invalid = unresolved
+        except Exception as exc:
+            evidence.warnings.append(
+                f"entity evidence retry failed: {type(exc).__name__}: {str(exc)[:1_000]}"
+            )
+    if invalid:
+        invalid_ids = {id(entity) for entity, _reason in invalid}
+        response.output.entities = [
+            entity for entity in response.output.entities if id(entity) not in invalid_ids
+        ]
+        evidence.warnings.extend(
+            f"entity dropped after evidence validation: {entity.name} ({reason})"
+            for entity, reason in invalid
+        )
+    return EnrichmentResult(
+        news_id=record.news_id,
+        enrichment_version=enrichment_version,
+        entity_extractor_version=ENTITY_EXTRACTOR_VERSION,
+        provider=provider.provider_name,
+        model_name=response.model_name,
+        status="completed_with_warnings" if evidence.warnings else "completed",
+        input_fingerprint=prepared.input_fingerprint,
+        input_manifest=prepared.input_manifest,
+        output=response.output,
+        usage=usage,
+        warnings=evidence.warnings,
+        started_at=prepared.started_at,
+        completed_at=datetime.now(UTC),
+    )
+
+
+def enrich_record(
+    record: NewsRecord,
+    provider: EnrichmentProvider,
+    *,
+    enrichment_version: str = "v1",
+    allow_network: bool = False,
+) -> EnrichmentResult:
+    prepared = _prepare_record(record, allow_network=allow_network)
     response = None
     usage = ProviderUsage()
     try:
-        response = provider.enrich(evidence)
+        response = provider.enrich(prepared.evidence)
         usage = response.usage
-        source_aliases = {record.source_url: "tweet"} if record.source_url else {}
-        _validate_source_refs(response.output, evidence, source_aliases)
-        invalid = _repair_entity_evidence(response.output, evidence)
-        repair = getattr(provider, "repair", None)
-        if invalid and callable(repair):
-            feedback = "; ".join(f"{entity.name!r}: {reason}" for entity, reason in invalid)
-            try:
-                retry = repair(evidence, feedback)
-                usage = _usage_sum(usage, retry.usage)
-                _validate_source_refs(retry.output, evidence, source_aliases)
-                retry_invalid = _repair_entity_evidence(retry.output, evidence)
-                retry_invalid_ids = {id(entity) for entity, _reason in retry_invalid}
-                retry_entities = {
-                    (
-                        normalize_name(html.unescape(entity.name)),
-                        entity.entity_type,
-                        entity.mention_role,
-                    ): entity
-                    for entity in retry.output.entities
-                    if id(entity) not in retry_invalid_ids
-                }
-                invalid_ids = {id(entity) for entity, _reason in invalid}
-                unresolved: list[tuple[ExtractedEntity, str]] = []
-                repaired_entities = []
-                for entity in response.output.entities:
-                    if id(entity) not in invalid_ids:
-                        repaired_entities.append(entity)
-                        continue
-                    key = (
-                        normalize_name(html.unescape(entity.name)),
-                        entity.entity_type,
-                        entity.mention_role,
-                    )
-                    replacement = retry_entities.get(key)
-                    if replacement is None:
-                        unresolved.append(
-                            (entity, "validation-repair retry did not return valid evidence")
-                        )
-                    else:
-                        repaired_entities.append(replacement)
-                        evidence.warnings.append(
-                            f"entity evidence repaired by provider retry: {entity.name}"
-                        )
-                response.output.entities = repaired_entities
-                invalid = unresolved
-            except Exception as exc:
-                evidence.warnings.append(
-                    f"entity evidence retry failed: {type(exc).__name__}: {str(exc)[:1_000]}"
-                )
-        if invalid:
-            invalid_ids = {id(entity) for entity, _reason in invalid}
-            response.output.entities = [
-                entity for entity in response.output.entities if id(entity) not in invalid_ids
-            ]
-            evidence.warnings.extend(
-                f"entity dropped after evidence validation: {entity.name} ({reason})"
-                for entity, reason in invalid
-            )
-        return EnrichmentResult(
-            news_id=record.news_id,
+        return _finalize_result(
+            prepared,
+            provider,
+            response,
             enrichment_version=enrichment_version,
-            entity_extractor_version=ENTITY_EXTRACTOR_VERSION,
-            provider=provider.provider_name,
-            model_name=response.model_name,
-            status="completed_with_warnings" if evidence.warnings else "completed",
-            input_fingerprint=input_fingerprint,
-            input_manifest=input_manifest,
-            output=response.output,
             usage=usage,
-            warnings=evidence.warnings,
-            started_at=started_at,
-            completed_at=datetime.now(UTC),
         )
     except Exception as exc:
-        return EnrichmentResult(
-            news_id=record.news_id,
+        return _failed_result(
+            prepared,
+            provider,
             enrichment_version=enrichment_version,
-            entity_extractor_version=ENTITY_EXTRACTOR_VERSION,
-            provider=provider.provider_name,
-            model_name=response.model_name if response else provider.model_name,
-            status="failed",
-            input_fingerprint=input_fingerprint,
-            input_manifest=input_manifest,
+            response=response,
             usage=usage,
-            warnings=evidence.warnings,
-            error=f"{type(exc).__name__}: {str(exc)[:4_000]}",
-            started_at=started_at,
-            completed_at=datetime.now(UTC),
+            exc=exc,
         )
+
+
+def enrich_records(
+    records: list[NewsRecord],
+    provider: EnrichmentProvider,
+    *,
+    enrichment_version: str = "v1",
+    allow_network: bool = False,
+) -> list[EnrichmentResult]:
+    """Enrich one or more tweets, using one provider call when the provider supports it."""
+
+    if len(records) <= 1:
+        return [
+            enrich_record(
+                record,
+                provider,
+                enrichment_version=enrichment_version,
+                allow_network=allow_network,
+            )
+            for record in records
+        ]
+    enrich_many = getattr(provider, "enrich_many", None)
+    if not callable(enrich_many):
+        return [
+            enrich_record(
+                record,
+                provider,
+                enrichment_version=enrichment_version,
+                allow_network=allow_network,
+            )
+            for record in records
+        ]
+
+    prepared_list = [_prepare_record(record, allow_network=allow_network) for record in records]
+    try:
+        by_news_id = enrich_many(
+            [(prepared.record.news_id, prepared.evidence) for prepared in prepared_list]
+        )
+    except Exception as exc:
+        return [
+            _failed_result(
+                prepared,
+                provider,
+                enrichment_version=enrichment_version,
+                response=None,
+                usage=ProviderUsage(),
+                exc=exc,
+            )
+            for prepared in prepared_list
+        ]
+
+    results: list[EnrichmentResult] = []
+    for prepared in prepared_list:
+        response = by_news_id.get(prepared.record.news_id)
+        if response is None:
+            results.append(
+                _failed_result(
+                    prepared,
+                    provider,
+                    enrichment_version=enrichment_version,
+                    response=None,
+                    usage=ProviderUsage(),
+                    exc=ValueError(
+                        f"batch response missing news_id: {prepared.record.news_id}"
+                    ),
+                )
+            )
+            continue
+        try:
+            results.append(
+                _finalize_result(
+                    prepared,
+                    provider,
+                    response,
+                    enrichment_version=enrichment_version,
+                    usage=response.usage,
+                )
+            )
+        except Exception as exc:
+            results.append(
+                _failed_result(
+                    prepared,
+                    provider,
+                    enrichment_version=enrichment_version,
+                    response=response,
+                    usage=response.usage,
+                    exc=exc,
+                )
+            )
+    return results
