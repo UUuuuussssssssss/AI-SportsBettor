@@ -84,6 +84,29 @@ def pack_job_groups(
     return groups
 
 
+def claim_limit_for(
+    *,
+    concurrency: int,
+    in_flight: int,
+    batch_size: int,
+    batch_enrichment: bool,
+) -> int:
+    """Return how many jobs to claim this iteration, or 0 when saturated.
+
+    Claiming ``capacity * batch_size`` jobs lets ``pack_job_groups`` fill
+    enrichment batches, but non-enrichment jobs pack one per group, so the
+    number of in-flight groups can exceed ``concurrency``. A negative limit
+    must never reach PostgreSQL (``LIMIT must not be negative``).
+    """
+
+    capacity = concurrency - in_flight
+    if capacity <= 0:
+        return 0
+    if batch_enrichment:
+        return capacity * batch_size
+    return capacity
+
+
 class WorkerRuntime:
     def __init__(
         self,
@@ -130,10 +153,7 @@ class WorkerRuntime:
         if latest_version is None:
             raise RuntimeError("apply nflverse entity bank before processing resolution jobs")
         with self._candidate_lock:
-            if (
-                self._candidate_index is None
-                or self._bank_version_id != latest_version
-            ):
+            if self._candidate_index is None or self._bank_version_id != latest_version:
                 self._candidate_index = CandidateIndex(
                     self.resolution_repository.load_candidate_rows()
                 )
@@ -174,16 +194,12 @@ class WorkerRuntime:
         pending: list[tuple[JobRecord, NewsRecord, str]] = []
         for job in jobs:
             news_id = str(job.payload["news_id"])
-            version = str(
-                job.payload.get("enrichment_version") or self.settings.enrichment_version
-            )
+            version = str(job.payload.get("enrichment_version") or self.settings.enrichment_version)
             if self.enrichment_repository.has_completed(
                 news_id=news_id,
                 enrichment_version=version,
             ):
-                outcomes.append(
-                    (job, JobResult(job.job_id, job.job_type, "already_completed", {}))
-                )
+                outcomes.append((job, JobResult(job.job_id, job.job_type, "already_completed", {})))
                 continue
             record = self.enrichment_repository.load_record(news_id)
             if record is None:
@@ -212,9 +228,7 @@ class WorkerRuntime:
             if result.enrichment_version != job_version:
                 result = result.model_copy(update={"enrichment_version": job_version})
             if not result.status.startswith("completed"):
-                outcomes.append(
-                    (job, RuntimeError(result.error or "news enrichment failed"))
-                )
+                outcomes.append((job, RuntimeError(result.error or "news enrichment failed")))
                 continue
             self.enrichment_repository.persist_result(result)
             outcomes.append(
@@ -237,10 +251,7 @@ class WorkerRuntime:
 
     def _handle_enrich_news(self, job: JobRecord) -> JobResult:
         news_id = str(job.payload["news_id"])
-        version = str(
-            job.payload.get("enrichment_version")
-            or self.settings.enrichment_version
-        )
+        version = str(job.payload.get("enrichment_version") or self.settings.enrichment_version)
         if self.enrichment_repository.has_completed(
             news_id=news_id,
             enrichment_version=version,
@@ -577,11 +588,13 @@ def main(argv: list[str] | None = None) -> int:
                         )
                     continue
 
-                capacity = args.concurrency - len(futures)
-                if capacity:
-                    claim_limit = capacity
-                    if ENRICH_NEWS in job_types:
-                        claim_limit = capacity * settings.batch_size
+                claim_limit = claim_limit_for(
+                    concurrency=args.concurrency,
+                    in_flight=len(futures),
+                    batch_size=settings.batch_size,
+                    batch_enrichment=ENRICH_NEWS in job_types,
+                )
+                if claim_limit:
                     claimed = jobs.claim(
                         limit=claim_limit,
                         lease_owner=lease_owner,
@@ -594,9 +607,7 @@ def main(argv: list[str] | None = None) -> int:
                     ):
                         futures[executor.submit(runtime.handle_group, group)] = group
 
-                if args.once and not futures and jobs.unfinished_count(
-                    job_types=job_types
-                ) == 0:
+                if args.once and not futures and jobs.unfinished_count(job_types=job_types) == 0:
                     break
                 if futures:
                     wait(

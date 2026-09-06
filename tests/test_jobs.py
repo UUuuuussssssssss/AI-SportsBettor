@@ -19,6 +19,7 @@ from src.jobs.worker import (
     DEFAULT_CONCURRENCY,
     MAX_CONCURRENCY,
     WorkerRuntime,
+    claim_limit_for,
     pack_job_groups,
 )
 
@@ -96,9 +97,7 @@ def test_enqueue_job_is_deterministic_and_transactional() -> None:
     )
 
     assert first == second
-    assert "ON CONFLICT (job_type, idempotency_key) DO NOTHING" in sql(
-        connection.statements[0]
-    )
+    assert "ON CONFLICT (job_type, idempotency_key) DO NOTHING" in sql(connection.statements[0])
     assert "pg_notify" in sql(connection.statements[1])
 
 
@@ -232,3 +231,12 @@ def test_pack_job_groups_batches_same_version_enrich_news() -> None:
 def test_pack_job_groups_keeps_singles_when_batch_size_is_one() -> None:
     groups = pack_job_groups([_job("1"), _job("2")], batch_size=1)
     assert [[job.job_id for job in group] for group in groups] == [["1"], ["2"]]
+
+
+def test_claim_limit_is_never_negative_when_groups_exceed_concurrency() -> None:
+    # Ten workers, batch size two: a claim of twenty non-enrichment jobs packs
+    # into twenty single-job groups, leaving more groups in flight than threads.
+    assert claim_limit_for(concurrency=10, in_flight=20, batch_size=2, batch_enrichment=True) == 0
+    assert claim_limit_for(concurrency=10, in_flight=10, batch_size=2, batch_enrichment=True) == 0
+    assert claim_limit_for(concurrency=10, in_flight=7, batch_size=2, batch_enrichment=True) == 6
+    assert claim_limit_for(concurrency=10, in_flight=7, batch_size=2, batch_enrichment=False) == 3
